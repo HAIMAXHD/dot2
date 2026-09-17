@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tìm kiếm Câu hỏi v6.0 - SQLite & Camera OCR</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Thư viện Đọc SQLite -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
+  <!-- Thư viện Tìm kiếm Fuzzy -->
+  <script src="https://cdn.jsdelivr.net/npm/fuse.js@6.6.2/dist/fuse.min.js"></script>
+  <!-- Thư viện OCR -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
+  <style>
+    body { margin: 10px 15px; font-family: Arial, sans-serif; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; word-wrap: break-word; }
+    th, td { border: 1px solid #ccc; padding: 6px; text-align: left; vertical-align: top; }
+    th { background-color: #f3f3f3; position: sticky; top: 0; z-index: 1; }
+    td:nth-child(1), th:nth-child(1) { width: 45px; text-align: center; }
+    td:nth-child(7), th:nth-child(7) { width: 70px; text-align: center; }
+    .bold-blue { font-weight: bold; color: #1d4ed8; }
+    .italic-tiny { font-style: italic; font-size: 0.85em; color: #4b5563; }
+    .btn { background-color: #2563eb; color: white; padding: 6px 12px; border-radius: 6px; cursor: pointer; border: none; }
+    .btn:hover { opacity: 0.9; }
+    .btn-camera { background-color: #10b981; }
+    #videoContainer { display: none; position: relative; margin-bottom: 10px; }
+    #video { width: 100%; max-width: 500px; border-radius: 8px; border: 2px solid #10b981; }
+    #canvas { display: none; }
+    .loading-ocr { display: none; color: #d97706; font-weight: bold; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+  </style>
+</head>
+<body>
+  <div class="max-w-full mx-auto">
+    <h2 class="text-xl font-bold mb-3">📸 Tìm kiếm Tra cứu Câu hỏi (Cơ sở dữ liệu data.db)</h2>
+
+    <div class="flex flex-wrap gap-2 mb-3 items-center">
+      <button class="btn btn-camera" onclick="toggleCamera()">📷 Mở/Tắt Camera</button>
+      <span id="dbStatus" class="text-sm font-semibold text-gray-500">Đang tải dữ liệu data.db...</span>
+    </div>
+
+    <div id="videoContainer">
+      <video id="video" autoplay playsinline></video>
+      <div class="mt-2 flex gap-2">
+        <button class="btn bg-red-500" onclick="captureImage()">✨ Chụp & Tìm</button>
+      </div>
+    </div>
+    <canvas id="canvas"></canvas>
+    <div id="ocrStatus" class="loading-ocr mb-2">Đang tối ưu ảnh & nhận diện chữ... vui lòng đợi...</div>
+
+    <div class="flex items-center mb-2">
+      <input id="searchInput" type="text" placeholder="Nhập từ khóa hoặc quét từ camera..." class="border px-3 py-1.5 w-full rounded shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500" onkeyup="debounceSearch()">
+      <button class="btn bg-gray-300 text-black ml-2 font-bold" onclick="clearSearch()">RESET</button>
+    </div>
+
+    <div id="suggestionBox" class="mb-2 italic text-blue-600 font-medium"></div>
+
+    <table id="dataTable">
+      <thead>
+        <tr>
+          <th>STT</th>
+          <th>Câu hỏi</th>
+          <th>Đáp án 1</th>
+          <th>Đáp án 2</th>
+          <th>Đáp án 3</th>
+          <th>Đáp án 4</th>
+          <th>Đúng</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+
+  <script>
+    let data = [];
+    let fuse;
+    let searchTimeout;
+    let stream = null;
+
+    // --- Khởi tạo và Tải Database SQLite (data.db) ---
+    async function initDatabase() {
+      const dbStatus = document.getElementById("dbStatus");
+      try {
+        const SQL = await initSqlJs({
+          locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/${file}`
+        });
+
+        const response = await fetch('data.db');
+        if (!response.ok) throw new Error("Không tìm thấy file data.db");
+        
+        const buf = await response.arrayBuffer();
+        const db = new SQL.Database(new Uint8Array(buf));
+
+        // Truy vấn dữ liệu từ data_table
+        const stmt = db.prepare("SELECT col_1, col_2, col_3, col_4, col_5, col_6, col_7 FROM data_table");
+        
+        let index = 1;
+        data = [];
+        while (stmt.step()) {
+          const row = stmt.get();
+          // Bỏ qua dòng tiêu đề nếu có
+          if (row[0] === "STT" || row[1] === "Câu hỏi") continue;
+
+          let ans = (row[6] || "").toString().trim().toUpperCase();
+          if (ans === "A") ans = 1; 
+          else if (ans === "B") ans = 2;
+          else if (ans === "C") ans = 3; 
+          else if (ans === "D") ans = 4;
+          else ans = Number(ans) || 0;
+
+          row[6] = ans;
+          
+          const questionText = cleanText(row[1] || "");
+          data.push({
+            id: index++,
+            question: questionText,
+            normalized: removeAccents(questionText),
+            raw: row
+          });
+        }
+
+        stmt.free();
+        
+        // Khởi tạo Fuse Search
+        fuse = new Fuse(data, {
+          keys: ["normalized"],
+          threshold: 0.35, // Tăng độ chính xác tìm tương đối
+          distance: 100
+        });
+
+        dbStatus.textContent = `Đã kết nối data.db (${data.length} câu hỏi)`;
+        dbStatus.className = "text-sm font-semibold text-green-600";
+        renderTable(data.map(d => d.raw));
+
+      } catch (err) {
+        console.error(err);
+        dbStatus.textContent = "Lỗi tải file data.db!";
+        dbStatus.className = "text-sm font-semibold text-red-600";
+      }
+    }
+
+    // --- Làm sạch & Chuẩn hóa chuỗi ---
+    function cleanText(str) {
+      return str.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function removeAccents(str) {
+      return str
+        .normalize("NFD")
+        .replace(/[̀-ͯ]/g, "")
+        .replace(/đ/g, "d").replace(/Đ/g, "D")
+        .replace(/[^a-zA-Z0-0\s]/g, " ") // Bỏ ký tự đặc biệt do OCR tạo ra
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    // --- XỬ LÝ CAMERA & TIỀN XỬ LÝ ẢNH TỐI ƯU OCR ---
+    async function toggleCamera() {
+      const container = document.getElementById('videoContainer');
+      const video = document.getElementById('video');
+      
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+        container.style.display = 'none';
+      } else {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } } 
+          });
+          video.srcObject = stream;
+          container.style.display = 'block';
+        } catch (err) {
+          alert("Không thể truy cập Camera. Hãy cấp quyền ứng dụng!");
+        }
+      }
+    }
+
+    async function captureImage() {
+      const video = document.getElementById('video');
+      const canvas = document.getElementById('canvas');
+      const status = document.getElementById('ocrStatus');
+      const ctx = canvas.getContext('2d');
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0);
+
+      // Thuật toán Tối ưu hóa ảnh (Xám & Tăng tương phản) giúp Tesseract đọc nét chữ chuẩn hơn
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const d = imgData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        let gray = 0.2126 * d[i] + 0.7152 * d[i+1] + 0.0722 * d[i+2];
+        // Tăng độ tương phản (Binarization/Contrast)
+        gray = gray > 130 ? 255 : (gray < 90 ? 0 : gray);
+        d[i] = d[i+1] = d[i+2] = gray;
+      }
+      ctx.putImageData(imgData, 0, 0);
+
+      status.style.display = 'block';
+      
+      try {
+        const result = await Tesseract.recognize(canvas.toDataURL('image/png'), 'vie+eng', {
+          corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@4/tesseract-core.wasm.js'
+        });
+        
+        let text = result.data.text;
+        text = removeAccents(text); // Làm sạch bớt nhiễu từ kết quả scan
+        document.getElementById('searchInput').value = text;
+        searchData();
+      } catch (e) {
+        console.error(e);
+        alert("Lỗi trong quá trình nhận diện hình ảnh.");
+      } finally {
+        status.style.display = 'none';
+      }
+    }
+
+    // --- HIỂN THỊ VÀ TÌM KIẾM ---
+    function renderTable(arr) {
+      const tbody = document.getElementById("tableBody");
+      tbody.innerHTML = "";
+      arr.forEach((row, index) => {
+        const tr = document.createElement("tr");
+        const correctIdx = Number(row[6]);
+        
+        for (let i = 0; i < 7; i++) {
+          const td = document.createElement("td");
+          td.innerHTML = row[i] ?? "";
+          if (i === 1 + correctIdx && correctIdx > 0) {
+            td.classList.add("bold-blue");
+          } else if ([2,3,4,5].includes(i)) {
+            td.classList.add("italic-tiny");
+          }
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      });
+    }
+
+    function debounceSearch() {
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(searchData, 250);
+    }
+
+    function searchData() {
+      const kw = removeAccents(document.getElementById("searchInput").value);
+      if (!kw) { 
+        renderTable(data.map(d => d.raw)); 
+        document.getElementById("suggestionBox").textContent = "";
+        return; 
+      }
+      
+      if (!fuse) return;
+      
+      const res = fuse.search(kw);
+      renderTable(res.slice(0, 50).map(r => r.item.raw));
+      document.getElementById("suggestionBox").textContent = `Tìm thấy ${res.length} kết quả phù hợp.`;
+    }
+
+    function clearSearch() {
+      document.getElementById("searchInput").value = "";
+      searchData();
+    }
+
+    // Tự động tải DB khi mở trang
+    window.onload = initDatabase;
+  </script>
+</body>
+</html>
