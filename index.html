@@ -1,1 +1,273 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Agribank Scan v11.0 - 2306</title>
+  
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Sử dụng sql.js để đọc file SQLite database -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/fuse.js@6.6.2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
 
+  <style>
+    body { background-color: #f1f5f9; font-family: ui-sans-serif, system-ui; }
+    .camera-box { position: relative; width: 100%; height: 300px; background: #000; overflow: hidden; }
+    #video { width: 100%; height: 100%; object-fit: cover; }
+    
+    .panoramic-overlay {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 92%; height: 70px;
+      border: 2px solid #10b981;
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6);
+      border-radius: 4px;
+      pointer-events: none;
+    }
+    .scan-line {
+      position: absolute; width: 100%; height: 2px;
+      background: rgba(16, 185, 129, 0.8);
+      box-shadow: 0 0 10px #10b981;
+      animation: moveLine 1.5s infinite linear;
+    }
+    @keyframes moveLine { 0% { top: 0; } 100% { top: 100%; } }
+
+    .result-card { background: white; border-radius: 12px; padding: 16px; margin-bottom: 12px; border-left: 6px solid #cbd5e1; transition: all 0.3s; }
+    .result-card.best-match { border-left-color: #059669; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+    
+    .ans-item { padding: 10px; border-radius: 8px; margin-top: 6px; font-size: 0.95rem; line-height: 1.4; border: 1px solid transparent; }
+    .is-true { background: #ecfdf5; color: #065f46; font-weight: 700; border-color: #34d399; }
+    
+    /* Style cho phần sai */
+    .is-false { color: #64748b; opacity: 0.8; }
+    .diff-wrong { color: #dc2626; text-decoration: line-through; font-weight: 600; }
+    
+    .loading-state { display: none; position: absolute; inset: 0; background: rgba(0,0,0,0.8); z-index: 60; align-items: center; justify-content: center; color: white; }
+  </style>
+</head>
+<body class="pb-10">
+
+  <div class="camera-box">
+    <video id="video" autoplay playsinline muted></video>
+    <div class="panoramic-overlay">
+        <div class="scan-line"></div>
+        <div class="absolute -top-6 left-0 text-[10px] text-emerald-400 font-bold uppercase tracking-widest">Vùng quét ưu tiên (ĐƯA CAMERA VÀO PHẦN CÂU HỎI)</div>
+    </div>
+    
+    <div class="absolute bottom-4 w-full px-6 flex flex-col gap-3">
+        <button onclick="smartCapture()" id="btnAction" class="bg-emerald-600 hover:bg-emerald-700 text-white w-full py-4 rounded-2xl font-black text-xl shadow-2xl active:scale-95 transition-all">
+            📸 QUÉT CÂU HỎI
+        </button>
+    </div>
+
+    <div id="loader" class="loading-state">
+        <div class="text-center">
+            <div class="inline-block animate-spin rounded-full h-8 w-8 border-4 border-emerald-500 border-t-transparent mb-2"></div>
+            <div class="text-sm font-bold tracking-tighter">ĐANG ĐỌC VÀ TÌM KIẾM...</div>
+        </div>
+    </div>
+  </div>
+
+  <div class="p-4">
+    <div class="mb-4 bg-white p-3 rounded-xl border border-gray-200 shadow-sm">
+        <div class="flex justify-between items-center mb-1">
+            <label class="text-[10px] font-black text-gray-400 uppercase">Văn bản nhận diện được:</label>
+            <span id="matchStatus" class="text-[10px] font-bold"></span>
+        </div>
+        <input id="ocrResult" type="text" onkeyup="manualSearch()" 
+               class="w-full bg-transparent border-none p-0 text-gray-700 font-medium focus:ring-0 text-sm italic" placeholder="Chưa có dữ liệu quét...">
+    </div>
+
+    <div class="flex items-center gap-2 mb-6">
+        <input type="file" id="upload" accept=".db,.sqlite" class="hidden" onchange="initData(event)">
+        <label for="upload" class="bg-slate-800 text-white px-5 py-2.5 rounded-xl text-xs font-bold shadow-md cursor-pointer">📂 NẠP BỘ ĐỀ DB</label>
+        <div id="count" class="text-xs font-mono text-slate-400">OFFLINE</div>
+    </div>
+
+    <div id="displayArea" class="space-y-4">
+        <div class="text-center py-12 text-gray-300">
+            <p class="text-3xl mb-2">🔍</p>
+            <p class="text-sm">Hãy nạp file và đưa khung quét vào dòng chữ câu hỏi</p>
+        </div>
+    </div>
+  </div>
+
+  <canvas id="procCanvas" class="hidden"></canvas>
+
+<script>
+let store = [];
+let searchEngine;
+let stream;
+
+window.onload = async () => {
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode: "environment", width: { ideal: 1920 } } 
+        });
+        document.getElementById('video').srcObject = stream;
+    } catch (e) { alert("Lỗi camera: Hãy đảm bảo bạn dùng HTTPS và cấp quyền máy ảnh."); }
+
+    // Tự động tải file data 26 09 2026.db nếu được lưu cùng thư mục web
+    try {
+        const response = await fetch('data 26 09 2026.db');
+        if (response.ok) {
+            const arrayBuffer = await response.arrayBuffer();
+            await loadSqlDb(arrayBuffer);
+        }
+    } catch (err) {
+        console.log("Chưa tự động tải được DB:", err);
+    }
+};
+
+async function loadSqlDb(arrayBuffer) {
+    try {
+        const SQL = await initSqlJs({
+            locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/${file}`
+        });
+        const db = new SQL.Database(new Uint8Array(arrayBuffer));
+        
+        // Lấy dữ liệu từ bảng data_table trong file SQLite
+        const res = db.exec("SELECT col_1, col_2, col_3, col_4, col_5, col_6, col_7 FROM data_table");
+        
+        if (res.length > 0 && res[0].values) {
+            const rows = res[0].values;
+            store = rows.filter(r => r[0] && !isNaN(r[0])).map(r => ({
+                id: r[0], 
+                title: r[1],
+                options: [r[2], r[3], r[4], r[5]],
+                ans: parseInt(r[6]),
+                clean: fastClean(r[1])
+            }));
+
+            searchEngine = new Fuse(store, { 
+                keys: ['clean'], 
+                threshold: 0.35, 
+                distance: 150,
+                ignoreLocation: false 
+            });
+            document.getElementById('count').innerText = `READY: ${store.length} CÂU`;
+        }
+    } catch (err) {
+        alert("Lỗi nạp cơ sở dữ liệu DB: " + err.message);
+    }
+}
+
+function initData(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+        await loadSqlDb(event.target.result);
+    };
+    reader.readAsArrayBuffer(file);
+}
+
+async function smartCapture() {
+    if (!store.length) return alert("Vui lòng nạp file cơ sở dữ liệu SQLite trước!");
+    const v = document.getElementById('video');
+    const canvas = document.getElementById('procCanvas');
+    const ctx = canvas.getContext('2d');
+    const loader = document.getElementById('loader');
+    loader.style.display = 'flex';
+
+    const ratio = v.videoWidth / v.clientWidth;
+    const w = (v.clientWidth * 0.92) * ratio;
+    const h = 70 * ratio;
+    const x = (v.videoWidth - w) / 2;
+    const y = (v.videoHeight - h) / 2;
+
+    canvas.width = w;
+    canvas.height = h;
+    ctx.filter = 'grayscale(1) contrast(1.5) brightness(1.2)';
+    ctx.drawImage(v, x, y, w, h, 0, 0, w, h);
+
+    try {
+        const out = await Tesseract.recognize(canvas.toDataURL('image/png'), 'vie');
+        const text = out.data.text.replace(/\s+/g, ' ').trim();
+        document.getElementById('ocrResult').value = text;
+        execSearch(text);
+    } catch (err) { console.error(err); }
+    loader.style.display = 'none';
+}
+
+function fastClean(s) {
+    if (!s) return "";
+    return s.toString().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").toLowerCase().trim();
+}
+
+/**
+ * Hàm so sánh và highlight sự khác biệt
+ * @param {string} targetText - Văn bản của phương án hiện tại
+ * @param {string} correctText - Văn bản của phương án đúng
+ */
+function highlightDiff(targetText, correctText) {
+    if (!targetText || !correctText) return targetText;
+    
+    const targetWords = targetText.toString().split(' ');
+    const correctWords = correctText.toString().toLowerCase();
+
+    return targetWords.map(word => {
+        const cleanWord = fastClean(word);
+        // Nếu từ này không xuất hiện trong câu đúng (sau khi đã xóa dấu/lowercas)
+        if (cleanWord && !fastClean(correctWords).includes(cleanWord)) {
+            return `<span class="diff-wrong">${word}</span>`;
+        }
+        return word;
+    }).join(' ');
+}
+
+function manualSearch() {
+    execSearch(document.getElementById('ocrResult').value);
+}
+
+function execSearch(txt) {
+    const q = fastClean(txt);
+    const box = document.getElementById('displayArea');
+    const status = document.getElementById('matchStatus');
+    if (!q) return;
+
+    const matches = searchEngine.search(q).slice(0, 3);
+    
+    if (!matches.length) {
+        status.innerText = "❌ KHÔNG KHỚP";
+        status.className = "text-[10px] font-bold text-red-500";
+        box.innerHTML = `<div class="text-center text-gray-400 py-10">Không tìm thấy câu hỏi phù hợp trong dữ liệu.</div>`;
+        return;
+    }
+
+    status.innerText = `✅ TÌM THẤY ${matches.length} KẾT QUẢ`;
+    status.className = "text-[10px] font-bold text-emerald-600";
+
+    box.innerHTML = matches.map((m, idx) => {
+        const item = m.item;
+        const correctText = item.options[item.ans - 1]; // Lấy nội dung đáp án đúng
+
+        return `
+            <div class="result-card ${idx === 0 ? 'best-match' : ''}">
+                <div class="flex items-start gap-3 mb-3">
+                    <span class="bg-slate-100 text-slate-600 px-2 py-1 rounded text-xs font-black">#${item.id}</span>
+                    <h3 class="font-bold text-slate-800 leading-snug text-sm">${item.title}</h3>
+                </div>
+                <div class="space-y-1">
+                    ${item.options.map((opt, i) => {
+                        if (!opt) return '';
+                        const isCorrect = (i + 1 === item.ans);
+                        // Nếu là câu sai, thực hiện so sánh để bôi đỏ từ khác biệt
+                        const displayContent = isCorrect ? opt : highlightDiff(opt, correctText);
+                        
+                        return `
+                            <div class="ans-item ${isCorrect ? 'is-true' : 'is-false'}">
+                                <span class="inline-block w-5">${isCorrect ? '●' : '○'}</span> ${displayContent}
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+                ${idx === 0 ? '<div class="mt-3 text-[9px] font-bold text-emerald-600 text-right uppercase tracking-widest">Khớp nhiều nhất</div>' : ''}
+            </div>
+        `;
+    }).join('');
+}
+</script>
+</body>
+</html>
